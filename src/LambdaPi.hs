@@ -20,6 +20,7 @@ import           Prelude                          hiding (lookup)
 import           Unbound.Generics.LocallyNameless
 
 import           Debug.Trace                      (traceM)
+import           GHC.Exts                         (toList)
 import           GHC.Stack                        (HasCallStack, callStack)
 
 type Var = Name Syn
@@ -121,13 +122,12 @@ typecheck = runFreshMT . typeSyn mempty
   typeSyn ctx syn = case syn of
     Var x -> case lookup (coerce x) ctx of
       Nothing -> do
-        traceM (show callStack)
+        mapM_ (traceM . show) (toList callStack)
         throwError "unknown identifier"
       Just t -> pure t
     Ann e p -> do
       typeChk ctx p VStar
       t <- evalChk p
-      traceM (show t)
       typeChk ctx e t
       pure t
     App e e' -> do
@@ -145,7 +145,6 @@ typecheck = runFreshMT . typeSyn mempty
       t      <- evalChk p
       (x, e) <- unbind p'
       let x' = coerce x
-      traceM (show x')
       typeChk (insert x' t ctx) e VStar
       pure VStar
 
@@ -154,17 +153,18 @@ typecheck = runFreshMT . typeSyn mempty
   typeChk ctx chk v = case chk of
     Inf e -> do
       v' <- typeSyn ctx e
+      traceM ("v:  " ++ show v)
+      traceM ("v': " ++ show v')
       unless (aeq v v') $ throwError "type mismatch syn"
-    Lam binder -> case v of
-      VPi t p' -> do
-        -- here, the variable names are assumed to be the same,
-        -- thus we only use the 'x' unbound from p'
-        (_, e ) <- unbind binder
-        (x, t') <- unbind p'
-        typeChk (insert x t ctx) e t'
+    Lam e -> case v of
+      VPi x t -> do
+        (_ , e') <- unbind e
+        (v', t') <- unbind t
+        typeChk (insert v' x ctx) e' t'
       v -> do
-        traceM (show v)
-        traceM (show callStack)
+        traceM ("e: " ++ show v)
+        traceM ("v: " ++ show v)
+        mapM_ (traceM . show) (toList callStack)
         throwError "type mismatch lam"
 
 ----------------------------------------

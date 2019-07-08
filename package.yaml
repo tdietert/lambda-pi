@@ -24,6 +24,9 @@ dependencies:
 - unbound-generics
 - containers
 - mtl
+- readline
+- pretty
+- parsec
 
 library:
   source-dirs: src

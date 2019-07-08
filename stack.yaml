@@ -39,28 +39,9 @@ packages:
 # - git: https://github.com/commercialhaskell/stack.git
 #   commit: e7b331f14bcffb8367cd58fbfc8b40ec7642100a
 #
-# extra-deps: []
+extra-deps:
+- readline-1.0.3.0@sha256:db011062b90fbfbbc8b02666d835742c1d4de1f990a89fc056ef8082f3e3cba0,912
 
-# Override default flag values for local packages and extra-deps
-# flags: {}
-
-# Extra package databases containing global packages
-# extra-package-dbs: []
-
-# Control whether we use the GHC we find on the path
-# system-ghc: true
-#
-# Require a specific version of stack, using version ranges
-# require-stack-version: -any # Default
-# require-stack-version: ">=2.1"
-#
-# Override the architecture used by stack, especially useful on Windows
-# arch: i386
-# arch: x86_64
-#
-# Extra directories used by stack for building
-# extra-include-dirs: [/path/to/dir]
-# extra-lib-dirs: [/path/to/dir]
-#
-# Allow a newer minor version of GHC than the snapshot specifies
-# compiler-check: newer-minor
+nix:
+  enable: true
+  shell-file: shell.nix
