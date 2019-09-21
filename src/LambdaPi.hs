@@ -11,7 +11,7 @@
 module LambdaPi
 where
 
-import Control.Monad                    (unless)
+import Control.Monad                    ((<=<), unless)
 import Control.Monad.Except             (MonadError, throwError)
 import Data.Coerce                      (coerce)
 import Data.Map                         (Map, insert, lookup)
@@ -22,6 +22,7 @@ import GHC.Exts                         (toList)
 import GHC.Generics                     (Generic)
 import GHC.Stack                        (HasCallStack, callStack)
 import Prelude                          hiding (lookup, pi)
+import Text.PrettyPrint                 (Doc, (<+>), brackets, char, colon, parens, text)
 
 import Unbound.Generics.LocallyNameless
 
@@ -68,7 +69,6 @@ instance Subst Syn Chk where
   isCoerceVar _ = Nothing
 
 type VVar = Name Value
-
 type VUniTele = Rebind (VVar, Embed Value) ()
 
 data Value
@@ -143,6 +143,9 @@ type Context = Map VVar Type
 typecheck :: HasCallStack => Syn -> Result Type
 typecheck = runFreshMT . typeSyn mempty
 
+typecheckPretty :: HasCallStack => Syn -> Result Doc
+typecheckPretty = runFreshMT . (ppr <=< typeSyn mempty)
+
 -- | Types that should be synthesized
 typeSyn :: HasCallStack => Context -> Syn -> TypecheckM Type
 typeSyn ctx syn = case syn of
@@ -213,3 +216,50 @@ ann e t = Ann e t
 
 (<|) :: Syn -> Chk -> Syn
 (<|) f x = App f x
+
+----------------------------------------
+-- Pretty Printer
+----------------------------------------
+
+class Pretty a where
+  ppr :: (Applicative m, Fresh m) => a -> m Doc
+
+instance Pretty Syn where
+  ppr (Var x) = pure (pprNameLocal x)
+  ppr (App e e') = (<+>) <$> ppr e <*> (parens <$> ppr e')
+  ppr (Ann e t) = do
+    pe <- ppr e
+    pt <- ppr t
+    pure (parens pe <+> colon <+> pt)
+  ppr Star = pure (char '*')
+  ppr (Pi xt_t) = do
+    (xt, e) <- unbind xt_t
+    pe <- ppr e
+    let ((x, Embed t), ()) = unrebind xt
+    pt <- ppr t
+    pure (char 'Π' <> parens (pprNameLocal x <+> colon <+> pt) <> char '.' <> pe)
+
+instance Pretty Chk where
+  ppr (Inf s) = ppr s
+  ppr (Lam xe) = do
+    (x, e) <- unbind xe
+    pe <- ppr e
+    pure (char 'λ' <> pprNameLocal x <> (char '.' <+> pe))
+
+instance Pretty Value where
+  ppr (VLam xv) = do
+    (x, v) <- unbind xv
+    pv <- ppr v
+    pure (char 'λ' <> pprNameLocal x <> char '.' <> pv)
+  ppr VStar = pure (char '*')
+  ppr (VPi xt_t)  = do
+    (xt, e) <- unbind xt_t
+    pe <- ppr e
+    let ((x, Embed t), ()) = unrebind xt
+    pt <- ppr t
+    pure (char 'Π' <> parens (pprNameLocal x <+> colon <+> pt) <> char '.' <> pe)
+  ppr (VVar x) = pure (pprNameLocal x)
+  ppr (VApp f v) = (<+>) <$> ppr f <*> (parens <$> ppr v)
+
+pprNameLocal :: Name a -> Doc
+pprNameLocal = text . name2String
