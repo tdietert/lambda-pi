@@ -241,6 +241,8 @@ parseITerm_
   :: Int -> [String] -> CharParser () ITerm_
 parseITerm_ 0 e =
   do
+      -- Here, a list of variable names and their corresponding types (as
+      -- CTerm_'s) (variable bindings) and the final lhs type is parsed.
       reserved lambdaPi "forall"
       (fe, t : ts) <- parseBindings_ True e
       reserved lambdaPi "."
