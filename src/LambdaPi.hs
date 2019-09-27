@@ -26,13 +26,18 @@ import Text.PrettyPrint                 (Doc, (<+>), brackets, char, colon, pare
 
 import Unbound.Generics.LocallyNameless
 
--- | Variables for Syn expressions
+----------------------------------------
+--  Lambda-Pi Terms
+----------------------------------------
+
+-- | Variables for Type-synthesizable expressions
 type Var = Name Syn
 
--- | Type synonym to leverage instances for 'Rebind'
-type UniTele expr = Rebind (Name Syn, Embed expr) ()
+-- | Type synonym, leveraging instances for 'Rebind'
+type UniTele expr = Rebind (Var, Embed expr) ()
 type Rebindable expr = (Typeable expr, Alpha expr)
 
+-- | Smart constructor for the UniTele type
 mkUniTele :: Rebindable expr => [Char] -> expr -> UniTele expr
 mkUniTele x e = rebind (s2n x, Embed e) ()
 
@@ -56,22 +61,24 @@ instance Subst Syn Syn where
   isvar (Var x) = Just (SubstName x)
   isvar _       = Nothing
 
--- | Type-checkable Terms
---
--- Sometimes called "checked" terms
---
+-- | Terms whose types must be checked (we cannot infer them via context)
 data Chk
   = Inf Syn -- ^ Inferable terms embedded in checkable terms
   | Lam (Bind Var Chk) -- ^ Lambda term
   deriving (Show, Generic)
 
 instance Alpha Chk
-
 instance Subst Chk Syn
 instance Subst Chk Chk
+-- We must tell unbound-generics how to rebuild the Chk expr after digging in
+-- and substituting the variable.
 instance Subst Syn Chk where
   isCoerceVar (Inf (Var x)) = Just (SubstCoerce x (Just . Inf))
   isCoerceVar _ = Nothing
+
+----------------------------------------
+-- Values
+----------------------------------------
 
 type VVar = Name Value
 type VUniTele = Rebind (VVar, Embed Value) ()
@@ -85,7 +92,7 @@ data Value
   | VPi (Bind VUniTele Value) -- ^ A type abstraction value
   | VVar VVar -- ^ A free variable, "neutral" term
   | VApp Value Value -- ^ A value application to another value, "neutral" term
-  -- Natural Number values
+  -- [WIP] Natural Number values
   | VNat
   | VZero
   | VSucc Value
@@ -96,6 +103,10 @@ instance Alpha Value
 instance Subst Value Value where
   isvar (VVar x) = Just (SubstName x)
   isvar _         = Nothing
+
+----------------------------------------
+-- Evaluation & Typechecking
+----------------------------------------
 
 type Env = Map VVar Value
 type Result = Either [Char]
@@ -112,7 +123,8 @@ eval = runFreshMT . evalSyn
 
 -- | Evaluation of terms
 --
--- We must write an evaluator as types can now depend on values
+-- We must write an evaluator as types can now depend on values, and in order to
+-- "compute the type" of a type, we must sometimes evaluate the "type expression"
 --
 evalSyn :: HasCallStack => Syn -> TypecheckM Value
 evalSyn syn = case syn of
@@ -131,7 +143,8 @@ evalSyn syn = case syn of
     t' <- evalChk p'
     let xt = rebind (vx, Embed t) ()
     pure $ VPi (bind xt t')
-  -- Evaluation of Natural Numbers
+
+  -- [WIP] Evaluation of Natural Numbers
   Nat -> pure VNat
   Zero -> pure VZero
   Succ k -> pure . VSucc =<< evalChk k
@@ -185,7 +198,7 @@ typecheck = runFreshMT . typeSyn mempty
 typecheckPretty :: HasCallStack => Syn -> Result Doc
 typecheckPretty = runFreshMT . (ppr <=< typeSyn mempty)
 
--- | Types that should be synthesized
+-- | Compute the type of a term whose type can be synthesized given a context
 typeSyn :: HasCallStack => Context -> Syn -> TypecheckM Type
 typeSyn ctx syn = case syn of
   Var x -> case lookup (coerce x) ctx of
@@ -214,7 +227,7 @@ typeSyn ctx syn = case syn of
     t <- evalChk p
     typeChk (insert (coerce x) t ctx) p' VStar
     pure VStar
-  -- Type "synthesis" of Natural numbers
+  -- [WIP] Type "synthesis" of Natural number terms
   Nat -> pure VStar
   Zero -> pure VNat
   Succ k -> do
@@ -235,7 +248,7 @@ typeSyn ctx syn = case syn of
 tarr :: Type -> Type -> Type
 tarr a b = VPi (bind (mkVUniTele "_" a) b)
 
--- Types that should be "checked"
+-- | Check the type of a given type-checkable term
 typeChk :: HasCallStack => Context -> Chk -> Type -> TypecheckM ()
 typeChk ctx chk v = case chk of
   Inf e -> do
