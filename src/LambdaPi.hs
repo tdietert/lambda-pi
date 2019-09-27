@@ -43,6 +43,11 @@ data Syn
   | App Syn Chk -- ^ Application
   | Pi (Bind (UniTele Chk) Chk)-- ^ The term for arrow types
   | Star -- ^ The term for kinds of types
+  -- Natural Numbers
+  | Nat -- Type of natural numbers
+  | NatElim Chk Chk Chk Chk -- Natural number eliminator*
+  | Zero -- Natural number '0'
+  | Succ Chk -- Successor of Nat
   deriving (Show, Generic)
 
 instance Alpha Syn
@@ -71,12 +76,20 @@ instance Subst Syn Chk where
 type VVar = Name Value
 type VUniTele = Rebind (VVar, Embed Value) ()
 
+mkVUniTele :: [Char] -> Value -> VUniTele
+mkVUniTele x e = rebind (s2n x, Embed e) ()
+
 data Value
   = VLam (Bind VVar Value) -- ^ A lam abstraction value
   | VStar -- ^ The evaluated type of 'Star'
   | VPi (Bind VUniTele Value) -- ^ A type abstraction value
   | VVar VVar -- ^ A free variable, "neutral" term
   | VApp Value Value -- ^ A value application to another value, "neutral" term
+  -- Natural Number values
+  | VNat
+  | VZero
+  | VSucc Value
+  | VNatElim Value Value Value Value
   deriving (Show, Generic)
 
 instance Alpha Value
@@ -91,7 +104,7 @@ type TypecheckM a = FreshMT Result a
 
 throwErrorTypecheckM :: (HasCallStack, MonadError e m) => e -> m a
 throwErrorTypecheckM err = do
-  mapM_ (traceM . show) (toList callStack)
+  mapM_ (traceM . show) (reverse $ toList callStack)
   throwError err
 
 eval :: Syn -> Result Value
@@ -101,20 +114,14 @@ eval = runFreshMT . evalSyn
 --
 -- We must write an evaluator as types can now depend on values
 --
-evalSyn :: Syn -> TypecheckM Value
+evalSyn :: HasCallStack => Syn -> TypecheckM Value
 evalSyn syn = case syn of
   Var x -> let vx = coerce x in pure (VVar vx)
   Ann e _ -> evalChk e
   App e e' -> do
     ve <- evalSyn e
     ve' <- evalChk e'
-    case ve of
-      VLam binder -> do
-        (x, body) <- unbind binder
-        pure (subst x ve' body)
-      -- This case embodies a "free" function name in the context
-      VVar x -> pure $ VApp (VVar x) ve'
-      _ -> throwErrorTypecheckM "invalid apply"
+    vapp ve ve'
   Star -> pure VStar
   Pi binding -> do
     (xp, p') <- unbind binding
@@ -124,10 +131,42 @@ evalSyn syn = case syn of
     t' <- evalChk p'
     let xt = rebind (vx, Embed t) ()
     pure $ VPi (bind xt t')
+  -- Evaluation of Natural Numbers
+  Nat -> pure VNat
+  Zero -> pure VZero
+  Succ k -> pure . VSucc =<< evalChk k
+  NatElim m mz ms k -> do
+    vk <- evalChk k
+    case vk of
+      VZero -> evalChk mz
+      VSucc l -> do
+        vm <- evalChk m
+        vmz <- evalChk mz
+        vms <- evalChk ms
+        let rec = VNatElim vm vmz vms l
+        vmsl <- vapp vms l
+        vapp vmsl rec
+      -- TODO "Neutral" term for VNatElim?
+      VVar x -> do
+        vm <- evalChk m
+        vmz <- evalChk mz
+        vms <- evalChk ms
+        pure (VNatElim vm vmz vms (VVar x))
+      _ -> throwErrorTypecheckM "evalSyn: NatElim"
 
+-- | Helper function for value application
+vapp :: HasCallStack => Value -> Value -> TypecheckM Value
+vapp ve ve' =
+  case ve of
+    VLam binder -> do
+      (x, body) <- unbind binder
+      pure (subst x ve' body)
+    -- This case embodies a "free" function name in the context
+    VVar x -> pure $ VApp (VVar x) ve'
+    _ -> throwErrorTypecheckM "invalid apply"
 
 -- | Evaluate a checkable expression
-evalChk :: Chk -> TypecheckM Value
+evalChk :: HasCallStack => Chk -> TypecheckM Value
 evalChk chk = case chk of
   Inf syn -> evalSyn syn
   Lam binding -> do
@@ -175,6 +214,26 @@ typeSyn ctx syn = case syn of
     t <- evalChk p
     typeChk (insert (coerce x) t ctx) p' VStar
     pure VStar
+  -- Type "synthesis" of Natural numbers
+  Nat -> pure VStar
+  Zero -> pure VNat
+  Succ k -> do
+    typeChk ctx k VNat
+    pure VNat
+  NatElim m mz ms k -> do
+    typeChk ctx m (tarr VNat VStar)
+    vm <- evalChk m
+    typeChk ctx mz =<< vapp vm VZero
+    vk <- evalChk k
+    vmk <- vapp vm vk
+    typeChk ctx ms =<<
+      pure . VPi . bind (mkVUniTele "l" VNat) . tarr vmk =<<
+        vapp vm (VSucc (VVar (s2n "l")))
+    typeChk mempty k VNat
+    pure vmk
+
+tarr :: Type -> Type -> Type
+tarr a b = VPi (bind (mkVUniTele "_" a) b)
 
 -- Types that should be "checked"
 typeChk :: HasCallStack => Context -> Chk -> Type -> TypecheckM ()
@@ -182,26 +241,32 @@ typeChk ctx chk v = case chk of
   Inf e -> do
     v' <- typeSyn ctx e
     unless (aeq v v') $
-      throwErrorTypecheckM "type mismatch syn"
+      throwErrorTypecheckM $ unlines
+        [ "type mismatch syn:"
+        , "  expected: "++ show v
+        , "  but got: " ++ show v'
+        ]
+
   Lam x_e -> case v of
     VPi xt_t'-> do
       (x , e) <- unbind x_e
       (xt, t') <- unbind xt_t'
       let ((_,Embed t),_) = unrebind xt
       typeChk (insert (coerce x) t ctx) e t'
-    v -> throwErrorTypecheckM ("type mismatch lam: " ++ show v)
+    _ -> throwErrorTypecheckM ("type mismatch lam: " ++ show v)
 
 ----------------------------------------
 -- DSL for term easier construction
 ----------------------------------------
 
-syn = Inf
-var = syn . Var . s2n
+chk = Inf
+svar = Var . s2n
+var = chk . svar
 
 lam x = Lam . bind (s2n x)
-pi' x t t' = syn $ Pi (bind (mkUniTele x t) t')
+pi' x t t' = chk $ Pi (bind (mkUniTele x t) t')
 
-id' = lam "x" (var "x")
+id' = lam "a" $ lam "x" (var "x")
 const' = lam "x" (lam "y" (var "x"))
 
 annConst' = Ann
@@ -216,6 +281,12 @@ ann e t = Ann e t
 
 (<|) :: Syn -> Chk -> Syn
 (<|) f x = App f x
+
+plus =
+   NatElim
+     (lam "_" (pi' "_" (Inf Nat) (Inf Nat)))
+     (lam "n" (var "n"))
+     (lam "k" (lam "rec" (lam "n" (chk (Succ (chk (App (svar "rec") (var "n"))))))))
 
 ----------------------------------------
 -- Pretty Printer
