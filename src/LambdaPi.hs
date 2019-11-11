@@ -66,7 +66,7 @@ instance Subst Syn Syn where
 -- | Terms whose types must be checked (we cannot infer them via context)
 data Chk
   = Inf Syn -- ^ Inferable terms embedded in checkable terms
-  | Lam (Bind Var Chk) -- ^ Lambda term
+  | Lam (Bind Var Chk) -- ^ Lambda term, must be "checked"
   deriving (Show, Generic)
 
 instance Alpha Chk
@@ -88,16 +88,32 @@ type VUniTele = Rebind (VVar, Embed Value) ()
 mkVUniTele :: [Char] -> Value -> VUniTele
 mkVUniTele x e = rebind (s2n x, Embed e) ()
 
+-- | "Evaluated" expressions (Syn + Chck) are values
+--
+--  Note:
+--    Nested application values may need to be "normalized" after a substituion
+--    occurs while evaluating the parent application expression or after the LHS
+--    (lambda) expression is fully evaluated; For instance, the LHS of the
+--    application value may be a variable that is bound by some outer lambda
+--    abstraction, and could produce a value with redexes that needs to be
+--    normalized:
+--
+--      λa.NatElim (λ_.Nat -> Nat) (λn.n) (λk.λrec.λn.S((rec) (n))) a
+--
+--    The NatElim value can be further reduced after substitution of the
+--    variable 'a' for a value, returning either λn.n or λk.λrec.λn.S(rec n)
+--    depending on the value of 'a'.
+--
 data Value
-  = VLam (Bind VVar Value) -- ^ A lam abstraction value
+  = VLam (Bind VVar Value) -- ^ An evaluated lambda abstraction
   | VStar -- ^ The evaluated type of 'Star'
-  | VPi (Bind VUniTele Value) -- ^ A type abstraction value
+  | VPi (Bind VUniTele Value) -- ^ A type abstraction
   | VVar VVar -- ^ A free variable, "neutral" term
-  | VApp Value Value -- ^ A value application to another value, "neutral" term
-  | VNat
-  | VZero
-  | VSucc Value
-  | VNatElim Value Value Value Value
+  | VApp Value Value -- ^ An evaluated application expression
+  | VNat -- ^ The type for Natural Numbers
+  | VZero -- ^ Peano Zero
+  | VSucc Value -- ^ Peano Successor
+  | VNatElim Value Value Value Value -- ^ The "Eliminator" for Natural Numbers
   deriving (Show, Generic)
 
 instance Alpha Value
@@ -120,7 +136,10 @@ throwErrorTypecheckM err = do
   throwError err
 
 eval :: Syn -> Result Value
-eval = runFreshMT . evalSyn mempty
+eval = unsafeEval mempty
+
+unsafeEval :: Context -> Syn -> Result Value
+unsafeEval ctx = runFreshMT . evalSyn ctx
 
 evalSynPretty :: Context -> Syn -> Result Doc
 evalSynPretty = evalPretty evalSyn
@@ -144,7 +163,7 @@ evalPretty runTypecheckM ctx a = do
 -- "compute the type" of a type, we must sometimes evaluate the "type expression"
 --
 evalSyn :: HasCallStack => Context -> Syn -> TypecheckM Value
-evalSyn ctx syn = traceM ("evalSyn: " ++ show syn) >> case syn of
+evalSyn ctx syn = case syn of
   Var x ->
     let vx = coerce x in
     case lookup vx ctx of
@@ -172,8 +191,6 @@ evalSyn ctx syn = traceM ("evalSyn: " ++ show syn) >> case syn of
   Nat -> pure VNat
   Zero -> pure VZero
   Succ k -> pure . VSucc =<< evalChk ctx k
-
-  -- TODO eval bug here prollably (See notebook):
   NatElim m mz ms k -> do
     vk <- evalChk ctx k
     case vk of
@@ -186,24 +203,26 @@ evalSyn ctx syn = traceM ("evalSyn: " ++ show syn) >> case syn of
         vmsl <- vapp ctx vms l
         res <- vapp ctx vmsl rec
         pure res
-      -- -- TODO "Neutral" term for VNatElim?
-      -- VVar x -> do
-      --   vm <- evalChk ctx m
-      --   vmz <- evalChk ctx mz
-      --   vms <- evalChk ctx ms
-      --   pure (VNatElim vm vmz vms (VVar x))
+      -- In the case that 'k' is a free variable:
+      VVar x -> do
+        vm <- evalChk ctx m
+        vmz <- evalChk ctx mz
+        vms <- evalChk ctx ms
+        pure (VNatElim vm vmz vms (VVar x))
       _ -> throwErrorTypecheckM "evalSyn: NatElim"
 
--- | Helper function for value application
+-- | Helper function for applying lambda abstraction values to argument values
+-- that always normalizes its arguments and resulting value.
 vapp :: HasCallStack => Context -> Value -> Value -> TypecheckM Value
 vapp ctx ve ve' = do
-  ne <- normalize ctx ve
-  ne' <- normalize ctx ve'
-  case ne of
+  case ve of
     VLam binder -> do
       (x, body) <- unbind binder
-      normalize ctx (subst x ne' body)
-    -- This case embodies a "free" function name in the context
+      normalize ctx (subst x ve' body)
+    -- This case is for the rare occasion when we are constructing "neutral"
+    -- expressions for evaluation _during_ evaluation of another expressions, or
+    -- when fully evaluating the LHS of an application expression whose LHS
+    -- value is a bound variable that has not yet been substituted.
     VVar x -> do
       case lookup x ctx of
         -- Free variable
@@ -212,7 +231,7 @@ vapp ctx ve ve' = do
           case mv of
             Nothing -> pure $ VApp (VVar x) ve'
             Just v -> vapp ctx v ve'
-    _ -> throwErrorTypecheckM $ "invalid apply: " ++ show ne
+    _ -> throwErrorTypecheckM $ "invalid apply: " ++ show ve
 
 
 -- | Evaluate a checkable expression
@@ -324,19 +343,20 @@ typeChk ctx chk v = case chk of
 
 -- | Normalize a value constructed by a substitution
 --
--- The need for this function stems from the fact that the evalution strategy
--- implicitly chosen during this dependent type theory study:
+-- The need for this function stems from the evalution strategy
+-- implicitly chosen during this dependent type theory study: call by value.
 --
--- When function application is evaluated, or when typechecking the App
--- expression, a variable substitution is performed to either compute the result
--- of the function application, or compute the return type of a value. In both
--- cases, a value is subsituted in place of a variable in the body of either a
--- lambda or a pi term; The resulting body needs to be normalized, as a VApp
--- value may contain a non-neutral term on the LHS that can be further
--- normalized. Un-normalized terms cause the evalutor to choke and throw errors,
--- as it always expects normalized terms. By calling 'normalize' on a resulting
--- expression after a substitution is performed should prevent these errors,
--- but commit us to a normal-order evaluation strategy.
+-- Note:
+--   When function application is evaluated, or when typechecking the App
+--   expression, a variable substitution is performed to either compute the result
+--   of the function application, or compute the return type of a value. In both
+--   cases, a value is subsituted in place of a variable in the body of either a
+--   lambda or a pi term; The resulting body needs to be normalized, as a VApp
+--   value may contain a non-neutral term on the LHS that can be further
+--   normalized. Un-normalized terms cause the evalutor to choke and throw errors,
+--   as it always expects normalized terms. By calling 'normalize' on a resulting
+--   expression after a substitution is performed should prevent these errors;
+--   i.e. using `vapp` every time we wish to construct an application value.
 --
 normalize :: Context -> Value -> TypecheckM Value
 normalize ctx v =
@@ -408,8 +428,8 @@ ann e t = Ann e t
 zero :: Chk
 zero = Inf Zero
 
-succ' :: Syn -> Chk
-succ' = Inf . Succ . Inf
+succ' :: Syn -> Syn
+succ' = Succ . Inf
 
 natElim =
   vlam "x" $
@@ -448,6 +468,19 @@ stdlib_plus =
       (lam "n" (var "n"))
     )
     (lam "k" $ lam "rec" $ lam "n" $ Inf (Succ (Inf (App (svar "rec") (var "n")))))
+
+-- | Evaluates 1 + 2
+--
+-- λ> plusExample
+-- Right (VSucc (VSucc (VSucc VZero)))
+--
+plusExample :: Result Value
+plusExample =
+    unsafeEval stdlib $
+      App (App stdlib_plus one) two
+  where
+    one = Inf (succ' Zero)
+    two = Inf (Succ one)
 
 ----------------------------------------
 -- Pretty Printer
