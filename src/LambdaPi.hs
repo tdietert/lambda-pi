@@ -35,20 +35,21 @@ import Unbound.Generics.LocallyNameless
 -- | Variables for Type-synthesizable expressions
 type Var = Name Syn
 
--- | Type synonym, leveraging instances for 'Rebind'
-type UniTele expr = Rebind (Var, Embed expr) ()
+-- | The binding pattern for pi-terms
+type PiBind expr = (Var, Embed expr)
+
 type Rebindable expr = (Typeable expr, Alpha expr)
 
--- | Smart constructor for the UniTele type
-mkUniTele :: Rebindable expr => [Char] -> expr -> UniTele expr
-mkUniTele x e = rebind (s2n x, Embed e) ()
+-- | Smart constructor for the PiBind type
+mkPiBind :: Rebindable expr => [Char] -> expr -> PiBind expr
+mkPiBind x e = (s2n x, Embed e)
 
 -- | Type-inferable (synthesizable) terms
 data Syn
   = Var Var -- ^ Free and bound variables
   | Ann Chk Chk -- ^ Annoted terms
   | App Syn Chk -- ^ Application
-  | Pi (Bind (UniTele Chk) Chk)-- ^ The term for arrow types
+  | Pi (Bind (PiBind Chk) Chk)-- ^ The term for arrow types
   | Star -- ^ The term for kinds of types
   -- Natural Numbers
   | Nat -- Type of natural numbers
@@ -83,10 +84,11 @@ instance Subst Syn Chk where
 ----------------------------------------
 
 type VVar = Name Value
-type VUniTele = Rebind (VVar, Embed Value) ()
 
-mkVUniTele :: [Char] -> Value -> VUniTele
-mkVUniTele x e = rebind (s2n x, Embed e) ()
+type VPiBind = (VVar, Embed Value)
+
+mkVPiBind :: [Char] -> Value -> VPiBind
+mkVPiBind x e = (s2n x, Embed e)
 
 -- | "Evaluated" expressions (Syn + Chck) are values
 --
@@ -107,7 +109,7 @@ mkVUniTele x e = rebind (s2n x, Embed e) ()
 data Value
   = VLam (Bind VVar Value) -- ^ An evaluated lambda abstraction
   | VStar -- ^ The evaluated type of 'Star'
-  | VPi (Bind VUniTele Value) -- ^ A type abstraction
+  | VPi (Bind VPiBind Value) -- ^ A type abstraction
   | VVar VVar -- ^ A free variable, "neutral" term
   | VApp Value Value -- ^ An evaluated application expression
   | VNat -- ^ The type for Natural Numbers
@@ -179,15 +181,12 @@ evalSyn ctx syn = case syn of
     vapp ctx ve ve'
   Star -> pure VStar
   Pi binding -> do
-    (xp, p') <- unbind binding
-    let ((x, Embed p),()) = unrebind xp
-        vx = coerce x
+    ((x, Embed p), p') <- unbind binding
+    let vx = coerce x
     t <- evalChk ctx p
     t' <- evalChk ctx p'
-    let xt = rebind (vx, Embed t) ()
+    let xt = (vx, Embed t)
     pure $ VPi (bind xt t')
-
-  -- [WIP] Evaluation of Natural Numbers
   Nat -> pure VNat
   Zero -> pure VZero
   Succ k -> pure . VSucc =<< evalChk ctx k
@@ -275,16 +274,14 @@ typeSyn ctx = \case
     sigma <- typeSyn ctx e
     case sigma of
       VPi binding -> do
-        (xt, t') <- unbind binding
-        let ((x, Embed t), ()) = unrebind xt
+        ((x, Embed t), t') <- unbind binding
         typeChk ctx e' t
         ve' <- evalChk ctx e'
         normalize ctx (subst (coerce x) ve' t')
       _ -> throwErrorTypecheckM ("illegal application: " ++ show sigma)
   Star    -> pure VStar
   Pi xp_p' -> do
-    (xp, p') <- unbind xp_p'
-    let ((x, Embed p), ()) = unrebind xp
+    ((x, Embed p), p') <- unbind xp_p'
     typeChk ctx p VStar
     t <- evalChk ctx p
     let varInfo = VarInfo Nothing t
@@ -302,7 +299,7 @@ typeSyn ctx = \case
     vk <- evalChk ctx k
     vmk <- vapp ctx vm vk
     t' <-
-      pure . VPi . bind (mkVUniTele "l" VNat) . tarr vmk =<<
+      pure . VPi . bind (mkVPiBind "l" VNat) . tarr vmk =<<
         vapp ctx vm (VSucc (VVar (s2n "l")))
     typeChk ctx ms t'
     typeChk ctx k VNat
@@ -310,7 +307,7 @@ typeSyn ctx = \case
 
 -- | A function type whose return type doesn't depend on the argument value
 tarr :: Type -> Type -> Type
-tarr a b = VPi (bind (mkVUniTele "_" a) b)
+tarr a b = VPi (bind (mkVPiBind "_" a) b)
 
 -- | Check the type of a given type-checkable term
 typeChk :: HasCallStack => Context -> Chk -> Type -> TypecheckM ()
@@ -328,9 +325,8 @@ typeChk ctx chk v = case chk of
   Lam x_e -> case v of
     VPi xt_t'-> do
       (x , e) <- unbind x_e
-      (xt, t') <- unbind xt_t'
-      let ((_,Embed t),_) = unrebind xt
-          varInfo = VarInfo Nothing t
+      ((_, Embed t), t') <- unbind xt_t'
+      let varInfo = VarInfo Nothing t
       typeChk (insert (coerce x) varInfo ctx) e t'
     _ -> throwErrorTypecheckM $ unlines
         [ "type mismatch lam: "
@@ -367,10 +363,9 @@ normalize ctx v =
       pure . VLam . bind x =<< normalize ctx body
     VStar -> pure VStar
     VPi binder -> do
-      (xt, t') <- unbind binder
-      let ((x, Embed t), ()) = unrebind xt
+      ((x, Embed t), t') <- unbind binder
       nt <- normalize ctx t
-      let nxt = mkVUniTele (name2String x) nt
+      let nxt = mkVPiBind (name2String x) nt
       nt' <- normalize ctx t'
       pure $ VPi (bind nxt nt')
     VApp ve ve' -> do
@@ -406,8 +401,8 @@ vvar = VVar . s2n
 
 lam x = Lam . bind (s2n x)
 vlam x = VLam . bind (s2n x)
-pi' x t t' = chk $ Pi (bind (mkUniTele x t) t')
-vpi x t t' = VPi (bind (mkVUniTele x t) t')
+pi' x t t' = chk $ Pi (bind (mkPiBind x t) t')
+vpi x t t' = VPi (bind (mkVPiBind x t) t')
 
 id' = lam "a" $ lam "x" (var "x")
 const' = lam "x" (lam "y" (var "x"))
@@ -449,15 +444,15 @@ vnatElim =
 arr = pi' "_"
 varr = vpi "_"
 
--- | Should we put the natElim value, or its type in this context? Why are
--- there two contexts? (see repLP lpve and lpte arguments in the
--- paper/LambdaPi.hs code).
---
---   There are two contexts because in one
+----------------------------------------
+-- Example
+----------------------------------------
+
 stdlib :: Context
 stdlib = fromList
   [ (s2n "natElim", VarInfo { varValue = Just natElim, varType = vnatElim }) ]
 
+stdlib_plus :: Syn
 stdlib_plus =
   App
     (App
@@ -504,9 +499,8 @@ instance Pretty Syn where
     pure (parens pe <+> colon <+> pt)
   ppr Star = pure (char '*')
   ppr (Pi xt_t) = do
-    (xt, e) <- unbind xt_t
+    ((x, Embed t), e) <- unbind xt_t
     pe <- ppr e
-    let ((x, Embed t), ()) = unrebind xt
     pt <- ppr t
     let ppx = pprNameLocal x
     if ppx == (text "_")
@@ -539,9 +533,8 @@ instance Pretty Value where
     pure (char 'λ' <> pprNameLocal x <> char '.' <> pv)
   ppr VStar = pure (char '*')
   ppr (VPi xt_t)  = do
-    (xt, e) <- unbind xt_t
+    ((x, Embed t), e) <- unbind xt_t
     pe <- ppr e
-    let ((x, Embed t), ()) = unrebind xt
     pt <- ppr t
     let ppx = pprNameLocal x
     if ppx == (text "_")
