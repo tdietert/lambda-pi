@@ -14,6 +14,7 @@ module LambdaPi
 where
 
 import Control.Monad                    ((<=<), unless)
+import Data.Foldable                    (foldlM)
 import Control.Monad.Except             (MonadError, throwError)
 import Data.Coerce                      (coerce)
 import Data.Map                         (Map, insert, lookup, fromList)
@@ -27,6 +28,7 @@ import Prelude                          hiding (lookup, pi)
 import Text.PrettyPrint                 (Doc, (<+>), brackets, char, colon, parens, render, text)
 
 import Unbound.Generics.LocallyNameless
+import Unbound.Generics.LocallyNameless.Name (Name(..))
 
 ----------------------------------------
 --  Lambda-Pi Terms
@@ -56,6 +58,11 @@ data Syn
   | NatElim Chk Chk Chk Chk -- Natural number eliminator*
   | Zero -- Natural number '0'
   | Succ Chk -- Successor of Nat
+  -- Length-indexed Vectors
+  | Vec Chk Chk
+  | Nil Chk
+  | Cons Chk Chk Chk Chk
+  | VecElim Chk Chk Chk Chk Chk Chk
   deriving (Show, Generic)
 
 instance Alpha Syn
@@ -116,6 +123,10 @@ data Value
   | VZero -- ^ Peano Zero
   | VSucc Value -- ^ Peano Successor
   | VNatElim Value Value Value Value -- ^ The "Eliminator" for Natural Numbers
+  | VNil Value -- ^ The empty Vector
+  | VCons Value Value Value Value -- ^ The non-empty Vector
+  | VVec Value Value -- ^ The type of Vectors
+  | VVecElim Value Value Value Value Value Value -- ^ The "Eliminator" for Vectors
   deriving (Show, Generic)
 
 instance Alpha Value
@@ -209,6 +220,33 @@ evalSyn ctx syn = case syn of
         vms <- evalChk ctx ms
         pure (VNatElim vm vmz vms (VVar x))
       _ -> throwErrorTypecheckM "evalSyn: NatElim"
+  VecElim a m mn mc k xs -> do
+    vmn <- evalChk ctx mn
+    vmc <- evalChk ctx mc
+    vxs <- evalChk ctx xs
+    case vxs of
+      VNil _ -> pure vmn
+      VCons _ vl' vx' vxs' -> do
+        va <- evalChk ctx a
+        vm <- evalChk ctx m
+        vk <- evalChk ctx k
+        let rec = VVecElim va vm vmn vmc vl' vxs'
+        vapps ctx vmc [vl', vx', vxs', rec]
+      VVar x -> do
+        va <- evalChk ctx a
+        vm <- evalChk ctx m
+        vk <- evalChk ctx k
+        pure (VVecElim va vm vmn vmc vk (VVar x))
+      _ -> throwErrorTypecheckM "evalSyn: VecElim"
+  Nil a -> pure . VNil =<< evalChk ctx a
+  Cons a k x xs ->
+    VCons <$> evalChk ctx a
+          <*> evalChk ctx k
+          <*> evalChk ctx x
+          <*> evalChk ctx xs
+  Vec a k ->
+    VVec <$> evalChk ctx a
+         <*> evalChk ctx k
 
 -- | Helper function for applying lambda abstraction values to argument values
 -- that always normalizes its arguments and resulting value.
@@ -232,6 +270,8 @@ vapp ctx ve ve' = do
             Just v -> vapp ctx v ve'
     _ -> throwErrorTypecheckM $ "invalid apply: " ++ show ve
 
+vapps :: HasCallStack => Context -> Value -> [Value] -> TypecheckM Value
+vapps ctx = foldlM (vapp ctx)
 
 -- | Evaluate a checkable expression
 evalChk :: HasCallStack => Context -> Chk -> TypecheckM Value
@@ -304,6 +344,58 @@ typeSyn ctx = \case
     typeChk ctx ms t'
     typeChk ctx k VNat
     pure vmk
+  Vec a k -> do
+    typeChk ctx a VStar
+    typeChk ctx k VNat
+    pure VStar
+  Nil a -> do
+    typeChk ctx a VStar
+    va <- evalChk ctx a
+    pure (VVec va VZero)
+  Cons a k x xs -> do
+    typeChk ctx a VStar
+    va <- evalChk ctx a
+    typeChk ctx k VNat
+    vk <- evalChk ctx k
+    typeChk ctx x va
+    typeChk ctx xs (VVec va vk)
+    pure (VVec va (VSucc vk))
+  VecElim a m mn mc k vs -> do
+    typeChk ctx a VStar
+    va <- evalChk ctx a
+    -- typecheck m
+    mTyp <-
+      pure . VPi . bind (mkVPiBind "k" VNat) $
+        tarr (VVec va (VVar (s2n "k"))) VStar
+    typeChk ctx m mTyp
+    vm <- evalChk ctx m
+    -- typecheck mn
+    mnTyp <- vapps ctx vm [VZero, VNil va]
+    typeChk ctx mn mnTyp
+    vmn <- evalChk ctx mn
+    -- typecheck mc
+    let vl@(VVar (Fn lstr _)) = VVar (s2n "l")
+        vx@(VVar (Fn xstr _)) = VVar (s2n "x")
+        vxs@(VVar (Fn xsstr _)) = VVar (s2n "xs")
+    mcTyp <-
+      pure .
+        VPi . bind (mkVPiBind lstr VNat) .
+          VPi . bind (mkVPiBind xstr va) .
+            VPi . bind (mkVPiBind xsstr (VVec va vl)) =<< do
+              lhs <- vapps ctx vm [vl, vxs]
+              rhs <- vapps ctx vm [VSucc vl, VCons va vl vx vxs]
+              pure $ tarr lhs rhs
+    typeChk ctx mc mcTyp
+    vmc <- evalChk ctx mc
+    -- typecheck k
+    typeChk ctx k VNat
+    vk <- evalChk ctx k
+    -- typehcheck vs
+    typeChk ctx vs (VVec va vk)
+    vvs <- evalChk ctx vs
+    -- return type of VecElim
+    vapps ctx vm [vk, vvs]
+
 
 -- | A function type whose return type doesn't depend on the argument value
 tarr :: Type -> Type -> Type
@@ -426,20 +518,27 @@ zero = Inf Zero
 succ' :: Syn -> Syn
 succ' = Succ . Inf
 
+natElim :: Value
 natElim =
-  vlam "x" $
-    vlam "y" $
-      vlam "z" $
-        vlam "a" $
-          VNatElim (vvar "x") (vvar "y") (vvar "z") (vvar "a")
+  vlam "x" $ vlam "y" $ vlam "z" $ vlam "a" $
+    VNatElim (vvar "x") (vvar "y") (vvar "z") (vvar "a")
 
 -- | The type of natElim
-vnatElim :: Value
-vnatElim =
+natElimTyp :: Type
+natElimTyp =
   vpi "m" (varr VNat VStar) $
     varr (VApp (vvar "m") (VZero)) $
       varr (vpi "l" VNat (varr (VApp (vvar "m") (vvar "l")) (VApp (vvar "m") (VSucc (vvar "l"))))) $
         vpi "k" VNat (VApp (vvar "m") (vvar "k"))
+
+vecElim :: Value
+vecElim =
+  vlam "a" $ vlam "m" $ vlam "mNil" $ vlam "mCons" $ vlam "k" $ vlam "vs" $
+    VVecElim (vvar "a") (vvar "m") (vvar "mNil") (vvar "mCons") (vvar "k") (vvar "vs")
+
+vecElimTyp :: Type
+vecElimTyp = undefined
+
 
 arr = pi' "_"
 varr = vpi "_"
@@ -450,7 +549,7 @@ varr = vpi "_"
 
 stdlib :: Context
 stdlib = fromList
-  [ (s2n "natElim", VarInfo { varValue = Just natElim, varType = vnatElim }) ]
+  [ (s2n "natElim", VarInfo { varValue = Just natElim, varType = natElimTyp }) ]
 
 stdlib_plus :: Syn
 stdlib_plus =
@@ -463,6 +562,10 @@ stdlib_plus =
       (lam "n" (var "n"))
     )
     (lam "k" $ lam "rec" $ lam "n" $ Inf (Succ (Inf (App (svar "rec") (var "n")))))
+
+stdlib_append :: Syn
+stdlib_append = undefined
+
 
 -- | Evaluates 1 + 2
 --

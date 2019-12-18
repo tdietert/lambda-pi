@@ -30,6 +30,9 @@ dependencies:
 
 library:
   source-dirs: src
+  ghc-options:
+    - -fwarn-incomplete-patterns
+    - -fwarn-incomplete-uni-patterns
 
 executables:
   lambda-pi-exe:
