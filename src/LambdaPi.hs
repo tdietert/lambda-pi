@@ -17,10 +17,11 @@ import Control.Monad                    ((<=<), unless)
 import Data.Foldable                    (foldlM)
 import Control.Monad.Except             (MonadError, throwError)
 import Data.Coerce                      (coerce)
-import Data.Map                         (Map, insert, lookup, fromList)
+import Data.Map                         (Map, fromList)
+import qualified Data.Map               as Map
 import Data.String                      (IsString)
 import Data.Typeable                    (Typeable)
-import Debug.Trace                      (traceM)
+import Debug.Trace                      (trace, traceM)
 import GHC.Exts                         (toList)
 import GHC.Generics                     (Generic)
 import GHC.Stack                        (HasCallStack, callStack)
@@ -179,7 +180,7 @@ evalSyn :: HasCallStack => Context -> Syn -> TypecheckM Value
 evalSyn ctx syn = case syn of
   Var x ->
     let vx = coerce x in
-    case lookup vx ctx of
+    case lookupVar x ctx of
       Nothing -> pure (VVar vx)
       Just (VarInfo mv t) ->
         case mv of
@@ -195,7 +196,8 @@ evalSyn ctx syn = case syn of
     ((x, Embed p), p') <- unbind binding
     let vx = coerce x
     t <- evalChk ctx p
-    t' <- evalChk ctx p'
+    let varInfo = VarInfo Nothing t
+    t' <- evalChk (insertVar x varInfo ctx) p'
     let xt = (vx, Embed t)
     pure $ VPi (bind xt t')
   Nat -> pure VNat
@@ -237,7 +239,7 @@ evalSyn ctx syn = case syn of
         vm <- evalChk ctx m
         vk <- evalChk ctx k
         pure (VVecElim va vm vmn vmc vk (VVar x))
-      _ -> throwErrorTypecheckM "evalSyn: VecElim"
+      _ -> throwErrorTypecheckM ("evalSyn: VecElim: " ++ show vxs)
   Nil a -> pure . VNil =<< evalChk ctx a
   Cons a k x xs ->
     VCons <$> evalChk ctx a
@@ -261,14 +263,29 @@ vapp ctx ve ve' = do
     -- when fully evaluating the LHS of an application expression whose LHS
     -- value is a bound variable that has not yet been substituted.
     VVar x -> do
-      case lookup x ctx of
+      case lookupVar x ctx of
         -- Free variable
-        Nothing -> pure $ VApp (VVar x) ve'
+        Nothing -> pure $ VApp ve ve'
         Just (VarInfo mv _) ->
           case mv of
-            Nothing -> pure $ VApp (VVar x) ve'
+            Nothing -> pure $ VApp ve ve'
             Just v -> vapp ctx v ve'
-    _ -> throwErrorTypecheckM $ "invalid apply: " ++ show ve
+    VNatElim m mz ms k ->
+      case k of
+        VVar _ -> pure $ VApp ve ve'
+        _ -> error "wut"
+    VApp f _ -> do
+      case f of
+        VVar x -> pure $ VApp ve ve'
+        _ -> do
+          napp <- normalize ctx ve
+          vapp ctx napp ve'
+    _ -> throwErrorTypecheckM $ unlines
+           ["invalid apply:"
+           , show ve
+           , "  to"
+           , show ve'
+           ]
 
 vapps :: HasCallStack => Context -> Value -> [Value] -> TypecheckM Value
 vapps ctx = foldlM (vapp ctx)
@@ -284,7 +301,21 @@ evalChk ctx chk = case chk of
 
 -- We store types in their evaluated form
 type Type = Value
+
+-- | A Context maps a variable to the variables type and value
+--
+-- TODO Make a "Pretty" instance for debugging
 type Context = Map VVar VarInfo
+
+insertVar :: Name a -> VarInfo -> Context -> Context
+insertVar nm vinfo ctx =
+  trace ("Inserting " ++ show nm ++ " as " ++ show vinfo) $
+    Map.insert (coerce nm) vinfo ctx
+
+lookupVar :: Name a -> Context -> Maybe VarInfo
+lookupVar nm ctx =
+  trace ("Looking up " ++ show nm) $
+    Map.lookup (coerce nm) ctx
 
 data VarInfo = VarInfo { varValue :: Maybe Value, varType :: Type }
   deriving Show
@@ -294,16 +325,19 @@ typecheck :: HasCallStack => Syn -> Result Type
 typecheck = runFreshMT . typeSyn mempty
 
 typecheckPretty :: HasCallStack => Syn -> Result Doc
-typecheckPretty = typecheckPretty' mempty
+typecheckPretty syn =
+  trace ("typecheckPretty: " ++ show syn) $
+    typecheckPretty' mempty syn
 
 typecheckPretty' :: HasCallStack => Context -> Syn -> Result Doc
 typecheckPretty' ctx = runFreshMT . (ppr <=< typeSyn ctx)
 
 -- | Compute the type of a term whose type can be synthesized given a context
 typeSyn :: HasCallStack => Context -> Syn -> TypecheckM Type
-typeSyn ctx = \case
-  Var x -> case lookup (coerce x) ctx of
-    Nothing -> throwErrorTypecheckM ("typeSyn: unknown identifier: " ++ show x)
+typeSyn ctx syn = case syn of
+  Var x -> case lookupVar x ctx of
+    Nothing -> throwErrorTypecheckM $
+      "typeSyn: unknown identifier: " ++ show x ++ " given " ++ show ctx
     Just (VarInfo v t) -> pure t
   Ann e p -> do
     typeChk ctx p VStar
@@ -325,7 +359,7 @@ typeSyn ctx = \case
     typeChk ctx p VStar
     t <- evalChk ctx p
     let varInfo = VarInfo Nothing t
-    typeChk (insert (coerce x) varInfo ctx) p' VStar
+    typeChk (insertVar x varInfo ctx) p' VStar
     pure VStar
   Nat -> pure VStar
   Zero -> pure VNat
@@ -398,7 +432,7 @@ typeSyn ctx = \case
 
 
 -- | A function type whose return type doesn't depend on the argument value
-tarr :: Type -> Type -> Type
+tarr :: HasCallStack => Type -> Type -> Type
 tarr a b = VPi (bind (mkVPiBind "_" a) b)
 
 -- | Check the type of a given type-checkable term
@@ -416,10 +450,10 @@ typeChk ctx chk v = case chk of
 
   Lam x_e -> case v of
     VPi xt_t'-> do
-      (x , e) <- unbind x_e
+      (x, e) <- unbind x_e
       ((_, Embed t), t') <- unbind xt_t'
       let varInfo = VarInfo Nothing t
-      typeChk (insert (coerce x) varInfo ctx) e t'
+      typeChk (insertVar x varInfo ctx) e t'
     _ -> throwErrorTypecheckM $ unlines
         [ "type mismatch lam: "
         , "  expected VPi, but got: "++ show v
@@ -446,7 +480,26 @@ typeChk ctx chk v = case chk of
 --   expression after a substitution is performed should prevent these errors;
 --   i.e. using `vapp` every time we wish to construct an application value.
 --
-normalize :: Context -> Value -> TypecheckM Value
+-- TODO Decide how this interacts with 'evalSyn'... since we represent
+-- "unevaluated" terms as 'Syn' or 'Chk' expressions, but 'Value's can still be
+-- "unevaluated", we end up having to duplicate a lot of the evaluation logic
+-- for already-evaluated values (that may still contain redexes after
+-- substitution. *A potential solution* is to parameterize the 'Syn' and 'Chk'
+-- types with a type variable denoting if the expression could contain redexes
+-- or not (is it "evaluatable" or "fully evaluated"?); These types could imply
+-- when to recursively call 'eval', and prevent calling 'eval' on expressions
+-- that are fully evaluated (e.g. the 'App' expression can produce expressions
+-- that still need to be evaluated, preventing them from being prematurely
+-- returned from the 'eval' functions if we added such a type index).
+-- Furthermore, this would reduce the need for duplicating the AST between
+-- 'Syn', 'Chk', and 'Value'.
+--
+--   [digression: perhaps adding GADTs could even further constrain the AST
+--   preventing several invalid expression formations by types alone, but it may
+--   be too complex with such "eliminator" values and types/values with many
+--   term parameters ('VecElim', 'Cons', 'NatElim', etc.)]
+--
+normalize :: HasCallStack => Context -> Value -> TypecheckM Value
 normalize ctx v =
   case v of
     VVar x -> pure (VVar x)
@@ -480,7 +533,38 @@ normalize ctx v =
           nmsl <- vapp ctx nms l
           vapp ctx nmsl rec
         VVar x -> pure $ VNatElim m mz ms nk
-        _ -> throwErrorTypecheckM "normalize: VNatElim"
+        _ -> throwErrorTypecheckM ("normalize: VNatElim: " ++ show nk)
+    VNil a -> pure . VNil =<< normalize ctx a
+    VCons a l x xs -> do
+      na <- normalize ctx a
+      nl <- normalize ctx l
+      nx <- normalize ctx x
+      nxs <- normalize ctx xs
+      pure $ VCons na nl nx nxs
+    -- TODO Cases for Vectors:
+    VVec a n -> do
+      na <- normalize ctx a
+      nn <- normalize ctx n
+      pure $ VVec na nn
+    VVecElim a m mn mc k xs -> do
+      -- here, we want to see if xs can be evaluated further:
+      vmn <- normalize ctx mn
+      vmc <- normalize ctx mc
+      vxs <- normalize ctx xs
+      case vxs of
+        VNil _ -> pure vmn
+        VCons _ vl' vx' vxs' -> do
+          va <- normalize ctx a
+          vm <- normalize ctx m
+          vk <- normalize ctx k
+          let rec = VVecElim va vm vmn vmc vl' vxs'
+          vapps ctx vmc [vl', vx', vxs', rec]
+        VVar x -> do
+          va <- normalize ctx a
+          vm <- normalize ctx m
+          vk <- normalize ctx k
+          pure (VVecElim va vm vmn vmc vk (VVar x))
+        _ -> throwErrorTypecheckM ("normalize: VecElim: " ++ show vxs)
 
 ----------------------------------------
 -- DSL for term easier construction
@@ -506,14 +590,21 @@ annConst' = Ann
        (pi' "z" (var "a") (pi' "w" (var "b") (var "b")))
   )
 
+-- | Apply an expression to one or more expressions
+apps :: Syn -> Chk -> [Chk] -> Syn
+apps f x xs = foldl (\g arg -> App g arg) f (x:xs)
+
+-- | Annotate a "checkable" term
 ann :: Chk -> Chk -> Syn
 ann e t = Ann e t
 
 (<|) :: Syn -> Chk -> Syn
 (<|) f x = App f x
 
-zero :: Chk
+zero, one, two :: Chk
 zero = Inf Zero
+one = Inf (succ' Zero)
+two = Inf (Succ one)
 
 succ' :: Syn -> Syn
 succ' = Succ . Inf
@@ -536,9 +627,32 @@ vecElim =
   vlam "a" $ vlam "m" $ vlam "mNil" $ vlam "mCons" $ vlam "k" $ vlam "vs" $
     VVecElim (vvar "a") (vvar "m") (vvar "mNil") (vvar "mCons") (vvar "k") (vvar "vs")
 
+-- | The type of vecElim
 vecElimTyp :: Type
-vecElimTyp = undefined
+vecElimTyp =
+  vpi "a" VStar $
+    vpi "m" (vpi "k" VNat (varr (VVec (vvar "a") (vvar "k")) VStar)) $
+      varr
+       (app2 (vvar "m") VZero (VNil (vvar "a")))
+       (varr
+         (vpi "l" VNat $
+           vpi "x" (vvar "a") $
+             vpi "xs" (VVec (vvar "a") (vvar "l")) $
+               varr
+                 (app2 (vvar "m") (vvar "l") (vvar "xs"))
+                 (app2 (vvar "m") (VSucc (vvar "l"))
+                   (VCons (vvar "a") (vvar "l") (vvar "x") (vvar "xs"))
+                 )
+         )
+         (vpi "k" VNat $
+           vpi "xs" (VVec (vvar "a") (vvar "k")) $
+             app2 (vvar "m") (vvar "k") (vvar "xs")
+         )
+       )
 
+
+app2 :: Type -> Type -> Type -> Type
+app2 a b c = VApp (VApp a b) c
 
 arr = pi' "_"
 varr = vpi "_"
@@ -549,23 +663,62 @@ varr = vpi "_"
 
 stdlib :: Context
 stdlib = fromList
-  [ (s2n "natElim", VarInfo { varValue = Just natElim, varType = natElimTyp }) ]
+  [ (s2n "natElim", VarInfo { varValue = Just natElim, varType = natElimTyp })
+  , (s2n "vecElim", VarInfo { varValue = Just vecElim, varType = vecElimTyp })
+  ]
 
 stdlib_plus :: Syn
 stdlib_plus =
-  App
-    (App
-      (App
-         (Var (s2n "natElim"))
-         (lam "_" $ arr (Inf Nat) (Inf Nat))
-      )
-      (lam "n" (var "n"))
-    )
-    (lam "k" $ lam "rec" $ lam "n" $ Inf (Succ (Inf (App (svar "rec") (var "n")))))
+  apps
+    (Var (s2n "natElim"))
+    (lam "_" $ arr (Inf Nat) (Inf Nat))
+    [ lam "n" (var "n")
+    , lam "k" $
+        lam "rec" $
+          lam "n" $
+            Inf (Succ (Inf (App (svar "rec") (var "n"))))
+    ]
+
+stdlib_plus_typ :: Chk
+stdlib_plus_typ =
+  pi' "x" (chk Nat) .
+    pi' "y" (chk Nat) $
+      chk Nat
 
 stdlib_append :: Syn
-stdlib_append = undefined
+stdlib_append = Ann stdlib_append' stdlib_append_typ
 
+stdlib_append' :: Chk
+stdlib_append' =
+  lam "a" . chk $
+    apps
+      (svar "vecElim")
+      (var "a")
+      [ lam "m" $ lam "_" $
+          arr
+            (pi' "n" (Inf Nat) (Inf (Vec (var "a") (var "n"))))
+            (Inf (Vec (var "a") (chk $ apps stdlib_plus (var "m") [var "n"])))
+      , lam "_" $ lam "v" $ var "v"
+      , lam "m" $ lam "v" $ lam "vs" $ lam "rec" $ lam "n" $ lam "w" $
+          chk $ Cons
+            (var "a")
+            (chk $ apps stdlib_plus (var "m") [var "n"])
+            (var "v")
+            (chk $ apps (svar "rec") (var "n") [var "w"])
+      ]
+
+stdlib_append_typ :: Chk
+stdlib_append_typ =
+  pi' "a" (chk Star) .
+    pi' "m" (chk Nat) .
+      pi' "v" (chk $ Vec (var "a") (var "m")) .
+        pi' "n" (chk Nat) .
+          pi' "w" (chk $ Vec (var "a") (var "n")) . chk $
+            Vec (var "a") (chk $ apps stdlib_plus (var "m") [var "n"])
+
+----------------------------------------
+-- Examples
+----------------------------------------
 
 -- | Evaluates 1 + 2
 --
@@ -576,9 +729,31 @@ plusExample :: Result Value
 plusExample =
     unsafeEval stdlib $
       App (App stdlib_plus one) two
+
+-- | Evaluates 'append [1] [0,1]'
+--
+-- λ> appendExample
+-- Right (VCons VNat (VSucc (VSucc (VSucc VZero))) VZero (VCons VNat (VSucc VZero) VZero (VCons VNat VZero (VSucc VZero) (VNil VNat))))
+--
+appendExample :: Result Value
+appendExample =
+    unsafeEval stdlib $
+      apps stdlib_append vecType [one, l, two, r]
   where
-    one = Inf (succ' Zero)
-    two = Inf (Succ one)
+    vecType = Inf Nat
+
+    -- Length-indexed vector with a single element: [1]
+    l =
+      Inf $
+        Cons vecType one zero $ Inf $
+            Nil vecType
+
+    -- Length-indexed vector with two elements: [0,1]
+    r =
+      Inf $
+        Cons vecType one zero $ Inf $
+          Cons vecType zero one $ Inf $
+            Nil vecType
 
 ----------------------------------------
 -- Pretty Printer
@@ -621,6 +796,8 @@ instance Pretty Syn where
     pms <- ppr ms
     pk <- ppr k
     pure $ text "NatElim" <+> pm <+> pmz <+> pms <+> pk
+  -- TODO
+  ppr _ = pure $ text "Not implemented yet"
 
 instance Pretty Chk where
   ppr (Inf s) = ppr s
@@ -660,6 +837,8 @@ instance Pretty Value where
     pms <- pprParens ms
     pk <- pprParens k
     pure $ text "NatElim" <+> pm <+> pmz <+> pms <+> pk
+  -- TODO
+  ppr _ = pure $ text "Not implemented yet"
 
 instance Pretty (Name Value) where
   ppr x = pure (pprNameLocal x)
